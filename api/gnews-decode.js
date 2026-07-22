@@ -1,66 +1,133 @@
-# api/decode.py
-# Vercel Python serverless function wrapping the `googlenewsdecoder` package.
-# Normalizes the package's {status, decoded_url, message} into the same
-# {ok, status, sourceUrl, error} contract as the JS version, so your
-# Power Automate steps don't need to change.
-#
-# Deploy checklist:
-#   1. Put this file at   api/decode.py
-#   2. Add a requirements.txt at the project root containing:  googlenewsdecoder
-#   3. Set a FLOW_SECRET env var in Vercel (the shared secret PA sends).
-#   4. Endpoint becomes:  https://<your-app>.vercel.app/api/decode
+// api/gnews-decode.js
+// Vercel serverless function: resolves a Google News RSS redirect link
+// (news.google.com/rss/articles/CBMi... or /read/... ) to its real publisher URL.
+// Decode-only and fast, so it stays well inside Vercel's 10s Hobby limit.
+// No npm dependencies — uses Node 18+ globals (fetch, Buffer, URL, AbortSignal).
+//
+// If your Vercel project is CommonJS, swap the final `export default` line for:
+//   module.exports = async function handler(req, res) { ... }
 
-import json
-import os
-from http.server import BaseHTTPRequestHandler
+const UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36";
 
-from googlenewsdecoder import gnewsdecoder
+function extractId(googleUrl) {
+  const u = new URL(googleUrl);
+  if (!/(^|\.)news\.google\.com$/.test(u.hostname)) {
+    throw new Error("not a news.google.com url");
+  }
+  const parts = u.pathname.split("/").filter(Boolean);
+  const id = parts[parts.length - 1];
+  if (!id) throw new Error("no article id in path");
+  return id;
+}
 
+// Legacy CBM… links carry the target URL directly inside the base64 payload.
+function tryLegacyBase64(id) {
+  if (!id.startsWith("CBM")) return null;
+  try {
+    const buf = Buffer.from(id.replace(/-/g, "+").replace(/_/g, "/"), "base64");
+    const s = buf.toString("latin1");
+    const m = s.match(/https?:\/\/[^\s"'<>\\\u0000-\u001f]+/);
+    if (m) return m[0];
+  } catch (_) {}
+  return null;
+}
 
-class handler(BaseHTTPRequestHandler):
-    def _send(self, code, obj):
-        payload = json.dumps(obj).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
+function fetchWithTimeout(url, opts = {}, ms = 6000) {
+  return fetch(url, { ...opts, signal: AbortSignal.timeout(ms) });
+}
 
-    def do_POST(self):
-        # Shared-secret gate so this isn't an open decoder.
-        if self.headers.get("x-api-key", "") != os.environ.get("FLOW_SECRET", ""):
-            return self._send(401, {"ok": False, "error": "unauthorized"})
+// New AU_yqL…/read/… links require the batchexecute handshake.
+async function decodeViaBatch(id) {
+  // 1) Load the article page to read the signing params.
+  const page = await fetchWithTimeout(
+    `https://news.google.com/rss/articles/${id}`,
+    { headers: { "User-Agent": UA } },
+    6000
+  );
+  const html = await page.text();
+  const sg = html.match(/data-n-a-sg="([^"]+)"/)?.[1];
+  const ts = html.match(/data-n-a-ts="([^"]+)"/)?.[1];
+  if (!sg || !ts) {
+    throw new Error("could not read signing params (interstitial/consent page?)");
+  }
 
-        length = int(self.headers.get("content-length", 0) or 0)
-        raw = self.rfile.read(length) if length else b"{}"
-        try:
-            data = json.loads(raw or b"{}")
-        except Exception:
-            data = {}
+  // 2) Build the batchexecute payload (fixed boilerplate + id, timestamp, signature).
+  const inner = JSON.stringify([
+    "garturlreq",
+    [
+      ["X", "X", ["X", "X"], null, null, 1, 1, "US:en", null, 1,
+        null, null, null, null, null, 0, 1],
+      "X", "X", 1, [1, 1, 1], 1, 1, null, 0, 0, null, 0,
+    ],
+    id,
+    Number(ts),
+    sg,
+  ]);
+  const body =
+    "f.req=" + encodeURIComponent(JSON.stringify([[["Fbv4je", inner]]]));
 
-        url = (data.get("url") or "").strip()
-        if not url:
-            return self._send(400, {"ok": False, "error": "missing url"})
+  const resp = await fetchWithTimeout(
+    "https://news.google.com/_/DotsSplashUi/data/batchexecute",
+    {
+      method: "POST",
+      headers: {
+        "User-Agent": UA,
+        "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+      },
+      body,
+    },
+    6000
+  );
+  const text = await resp.text();
 
-        try:
-            result = gnewsdecoder(url, interval=1)  # interval throttles to dodge 429s
-            if result.get("status"):
-                return self._send(
-                    200,
-                    {"ok": True, "status": "decoded", "sourceUrl": result["decoded_url"]},
-                )
-            return self._send(
-                200,
-                {
-                    "ok": False,
-                    "status": "failed",
-                    "sourceUrl": None,
-                    "error": result.get("message", "decode failed"),
-                },
-            )
-        except Exception as e:
-            # 200 with ok:false so Power Automate reads the body instead of throwing.
-            return self._send(
-                200,
-                {"ok": False, "status": "failed", "sourceUrl": None, "error": str(e)},
-            )
+  // 3) Parse the XSSI-guarded, sometimes-chunked response.
+  const cleaned = text.replace(/^\)\]\}'\n?/, "");
+  for (const line of cleaned.split("\n")) {
+    const t = line.trim();
+    if (!t.startsWith("[[")) continue;
+    try {
+      for (const item of JSON.parse(t)) {
+        if (
+          Array.isArray(item) &&
+          item[1] === "Fbv4je" &&
+          typeof item[2] === "string"
+        ) {
+          const parsed = JSON.parse(item[2]);
+          if (parsed && parsed[1]) return parsed[1];
+        }
+      }
+    } catch (_) {}
+  }
+  throw new Error("real url not found in batchexecute response");
+}
+
+export default async function handler(req, res) {
+  // Shared-secret gate so this isn't an open decoder / SSRF vector.
+  if ((req.headers["x-api-key"] || "") !== process.env.FLOW_SECRET) {
+    return res.status(401).json({ ok: false, error: "unauthorized" });
+  }
+
+  const googleUrl =
+    (req.method === "POST" ? req.body?.url : req.query?.url) || "";
+  if (!googleUrl) {
+    return res.status(400).json({ ok: false, error: "missing url" });
+  }
+
+  try {
+    const id = extractId(googleUrl);
+    let sourceUrl = tryLegacyBase64(id);
+    if (!sourceUrl) sourceUrl = await decodeViaBatch(id);
+    return res.status(200).json({ ok: true, status: "decoded", sourceUrl });
+  } catch (err) {
+    // Return 200 with ok:false so Power Automate reads the body
+    // instead of throwing on a 4xx/5xx and halting the loop.
+    return res.status(200).json({
+      ok: false,
+      status: "failed",
+      sourceUrl: null,
+      error: String(err.message || err),
+    });
+  }
+}
